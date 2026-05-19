@@ -2285,6 +2285,279 @@ def print_full_evaluation_table(summary_df, detail_df):
             print(f"  {cfg:<22}  " + "  ".join(f"{s:<10}" for s in signs))
 
 
+def pairwise_significance_test(detail_df, alpha=0.05):
+    """
+    Pairwise Wilcoxon signed-rank significance tests — referee response (Groups A, B, C).
+
+    Runs two-sided Wilcoxon signed-rank tests on per-seed paired scores for three
+    pre-defined groups of configuration comparisons, with Benjamini-Hochberg FDR
+    correction applied independently within each group.
+
+    Note: Coverage and CovGini are catalogue-level aggregates (one value per config,
+    not per seed) and cannot be tested with this approach.  They are excluded here;
+    the paper should note this limitation inline.
+
+    Parameters
+    ----------
+    detail_df : DataFrame
+        Long-form per-seed scores produced by full_evaluation() or
+        evaluate_on_seed_list().  Must contain columns:
+        'configuration', 'seed_product', and the six per-seed metric columns.
+    alpha : float
+        FDR threshold for Benjamini-Hochberg correction (default 0.05).
+
+    Returns
+    -------
+    results : dict[str, DataFrame]
+        Keys 'A', 'B', 'C' — one DataFrame per group with columns:
+        group, config_a, config_b, metric, n_seeds, mean_a, mean_b,
+        delta, p_raw, p_adj, reject, sig.
+
+    Groups
+    ------
+    A — each profile-aware config vs Content Only (7 configs × 6 metrics = 42 tests)
+        Tests whether adding skin-profile information reliably improves any metric.
+
+    B — within the content-family baseline triangle (3 pairs × 6 metrics = 18 tests)
+        Tests whether Content+Collab and Content+Reviews differ from Content Only
+        and from each other — establishes whether non-profile signals contribute.
+
+    C — Full Hybrid variant family, all pairwise combinations (6 pairs × 6 metrics = 36 tests)
+        Tests whether MMR and stochastic post-processing produce statistically
+        reliable metric differences, not just numerical ones.
+    """
+    from scipy.stats import wilcoxon
+    from statsmodels.stats.multitest import multipletests
+    import itertools
+
+    PER_SEED_METRICS = {
+        'skin_compat':  'SkinCompat',
+        'map_skin':     'MAP@5',
+        'routine_coh':  'RoutineCoh',
+        'diversity':    'Diversity',
+        'brand_div':    'BrandDiv',
+        'serendipity':  'Serendipity',
+    }
+    available_metrics = {k: v for k, v in PER_SEED_METRICS.items()
+                         if k in detail_df.columns}
+
+    all_configs = set(detail_df['configuration'].unique())
+
+    def _aligned_pair(cfg_a, cfg_b, metric):
+        """Return two value arrays aligned on shared seed_product index."""
+        a = (detail_df[detail_df['configuration'] == cfg_a]
+             .set_index('seed_product')[metric].sort_index())
+        b = (detail_df[detail_df['configuration'] == cfg_b]
+             .set_index('seed_product')[metric].sort_index())
+        shared = a.index.intersection(b.index)
+        if len(shared) < 10:
+            return None, None
+        return a.loc[shared].values, b.loc[shared].values
+
+    def _run_group(pairs, group_name):
+        rows, raw_pvals = [], []
+        for cfg_a, cfg_b in pairs:
+            if cfg_a not in all_configs or cfg_b not in all_configs:
+                continue
+            for raw_metric, display_metric in available_metrics.items():
+                a_arr, b_arr = _aligned_pair(cfg_a, cfg_b, raw_metric)
+                if a_arr is None:
+                    continue
+                delta = float(np.mean(a_arr - b_arr))
+                diffs = a_arr - b_arr
+                if np.all(diffs == 0):
+                    p_raw = 1.0
+                else:
+                    try:
+                        _, p_raw = wilcoxon(a_arr, b_arr, alternative='two-sided',
+                                            zero_method='wilcox')
+                    except ValueError:
+                        p_raw = 1.0
+                rows.append({
+                    'group':    group_name,
+                    'config_a': cfg_a,
+                    'config_b': cfg_b,
+                    'metric':   display_metric,
+                    'n_seeds':  len(a_arr),
+                    'mean_a':   round(float(np.mean(a_arr)), 4),
+                    'mean_b':   round(float(np.mean(b_arr)), 4),
+                    'delta':    round(delta, 4),
+                    'p_raw':    round(p_raw, 6),
+                })
+                raw_pvals.append(p_raw)
+
+        if not rows:
+            return pd.DataFrame()
+
+        result = pd.DataFrame(rows)
+        reject, p_adj, _, _ = multipletests(raw_pvals, alpha=alpha, method='fdr_bh')
+        result['p_adj']   = np.round(p_adj, 6)
+        result['reject']  = reject
+        result['sig']     = result['p_adj'].apply(
+            lambda p: '***' if p < 0.001 else ('**' if p < 0.01 else
+                      ('*'  if p < 0.05 else 'n.s.'))
+        )
+        return result
+
+    # ── Group definitions ──────────────────────────────────────────────────
+    PROFILE_AWARE_CONFIGS = [
+        'Content+Skin Profile',
+        'Collab+Skin Profile',
+        'review+Skin Profile',
+        'Full Hybrid',
+        'Full Hybrid + MMR',
+        'Full Hybrid Stochastic',
+        'Full Hybrid+MMR+stochastic',
+    ]
+    GROUP_A_PAIRS = [(cfg, 'Content Only') for cfg in PROFILE_AWARE_CONFIGS]
+
+    GROUP_B_PAIRS = [
+        ('Content Only',     'Content + Collab'),
+        ('Content Only',     'Content + Reviews'),
+        ('Content + Collab', 'Content + Reviews'),
+    ]
+
+    FH_VARIANTS = [
+        'Full Hybrid',
+        'Full Hybrid + MMR',
+        'Full Hybrid Stochastic',
+        'Full Hybrid+MMR+stochastic',
+    ]
+    GROUP_C_PAIRS = list(itertools.combinations(FH_VARIANTS, 2))
+
+    results = {
+        'A': _run_group(GROUP_A_PAIRS, 'A'),
+        'B': _run_group(GROUP_B_PAIRS, 'B'),
+        'C': _run_group(GROUP_C_PAIRS, 'C'),
+    }
+    return results
+
+
+def print_significance_results(sig_results, alpha=0.05):
+    """
+    Print formatted pairwise significance tables for Groups A, B, and C.
+
+    Each group is printed as a wide matrix (one row per config pair, one column
+    per metric) showing: delta (mean_a − mean_b) and BH-corrected significance.
+    A positive delta means config_a scores higher than config_b on that metric.
+    A summary count table is printed at the end.
+
+    Parameters
+    ----------
+    sig_results : dict[str, DataFrame]   output of pairwise_significance_test()
+    alpha       : float                  FDR threshold used (for display only)
+    """
+    SEP  = '=' * 115
+    THIN = '-' * 115
+
+    GROUP_DESCRIPTIONS = {
+        'A': ('Profile-aware configurations vs Content Only  '
+              '[config_a = profile-aware,  config_b = Content Only]'),
+        'B': ('Content-family configurations: all pairwise combinations  '
+              '[config_a scores minus config_b scores]'),
+        'C': ('Full Hybrid variant family: all pairwise combinations  '
+              '[config_a scores minus config_b scores]'),
+    }
+
+    METRICS_ORDER = ['SkinCompat', 'MAP@5', 'RoutineCoh', 'Diversity', 'BrandDiv', 'Serendipity']
+
+    print('\n' + SEP)
+    print('  PAIRWISE SIGNIFICANCE TESTS — REFEREE RESPONSE (Groups A, B, C)')
+    print('  Test: two-sided Wilcoxon signed-rank on per-seed paired scores.')
+    print(f'  Correction: Benjamini-Hochberg FDR (q = {alpha}) applied within each group.')
+    print('  Delta = mean(config_a metric) − mean(config_b metric);  positive = config_a higher.')
+    print('  Coverage and CovGini are catalogue-level aggregates — no per-seed test possible.')
+    print('  Significance: * p_adj < .05   ** p_adj < .01   *** p_adj < .001   n.s. = not significant')
+    print(SEP)
+
+    all_frames = []
+
+    for grp_key in ['A', 'B', 'C']:
+        df_grp = sig_results.get(grp_key, pd.DataFrame())
+        desc   = GROUP_DESCRIPTIONS.get(grp_key, '')
+
+        print(f'\n  GROUP {grp_key} — {desc}')
+
+        if df_grp.empty:
+            print('    No results (configurations not found in detail_df)')
+            continue
+
+        n_total = len(df_grp)
+        n_sig   = int((df_grp['sig'] != 'n.s.').sum())
+        print(f'  {n_sig} significant out of {n_total} tests after BH correction.')
+        print(THIN)
+
+        # Header row
+        avail_metrics = [m for m in METRICS_ORDER if m in df_grp['metric'].values]
+        pair_hdr = f"  {'Config A':<34}  {'Config B':<34}"
+        met_hdr  = '  '.join(f'{m:<16}' for m in avail_metrics)
+        print(f'{pair_hdr}  {met_hdr}')
+        print(f"  {'-'*34}  {'-'*34}  " + '  '.join(f'{"-"*16}' for _ in avail_metrics))
+
+        pairs = (df_grp[['config_a', 'config_b']]
+                 .drop_duplicates()
+                 .values.tolist())
+
+        for cfg_a, cfg_b in pairs:
+            sub  = (df_grp[(df_grp['config_a'] == cfg_a) &
+                           (df_grp['config_b'] == cfg_b)]
+                    .set_index('metric'))
+            pair_str = f"  {cfg_a:<34}  {cfg_b:<34}"
+            cells = []
+            for m in avail_metrics:
+                if m not in sub.index:
+                    cells.append(f"{'—':<16}")
+                    continue
+                row  = sub.loc[m]
+                d    = float(row['delta'])
+                sig  = str(row['sig'])
+                sign = '+' if d >= 0 else ''
+                cell = f'{sign}{d:.3f} {sig}'
+                cells.append(f'{cell:<16}')
+            print(f'{pair_str}  ' + '  '.join(cells))
+
+        all_frames.append(df_grp)
+        print()
+
+    # ── Cross-group summary ────────────────────────────────────────────────
+    if all_frames:
+        combined = pd.concat(all_frames, ignore_index=True)
+        print(SEP)
+        print('  SUMMARY — significant tests by group and metric (after BH correction)')
+        print(THIN)
+        sig_only = combined[combined['sig'] != 'n.s.'].copy()
+        if not sig_only.empty:
+            pivot = (sig_only
+                     .groupby(['group', 'metric'])
+                     .size()
+                     .unstack(fill_value=0)
+                     .reindex(columns=[m for m in METRICS_ORDER
+                                       if m in sig_only['metric'].values],
+                              fill_value=0))
+            print(pivot.to_string())
+        else:
+            print('  No significant results found.')
+
+        print()
+        print('  DIRECTION SUMMARY — metrics where profile-aware configs consistently beat Content Only')
+        print(THIN)
+        grp_a = sig_results.get('A', pd.DataFrame())
+        if not grp_a.empty:
+            sig_a = grp_a[grp_a['sig'] != 'n.s.']
+            pos_a = sig_a[sig_a['delta'] > 0].groupby('metric').size().rename('configs_better')
+            neg_a = sig_a[sig_a['delta'] < 0].groupby('metric').size().rename('configs_worse')
+            dir_df = pd.concat([pos_a, neg_a], axis=1).fillna(0).astype(int)
+            dir_df.index.name = 'metric'
+            print(f"  {'Metric':<16}  {'Configs beating Content Only':<30}  "
+                  f"{'Configs worse than Content Only'}")
+            print(f"  {'-'*16}  {'-'*30}  {'-'*30}")
+            for metric, row in dir_df.iterrows():
+                print(f"  {metric:<16}  {int(row.get('configs_better', 0)):<30}  "
+                      f"{int(row.get('configs_worse', 0))}")
+
+    print('\n' + SEP + '\n')
+
+
 def plot_full_evaluation(summary_df, detail_df,
                          save_path='full_evaluation.png'):
     """
@@ -3577,6 +3850,11 @@ print("\n-- Standard metric evaluation (150 per category, 7 configs) --")
 summary_df, detail_df = full_evaluation(n_per_skintype=150, top_n=10, random_seed=42)
 print_full_evaluation_table(summary_df, detail_df)
 plot_full_evaluation(summary_df, detail_df, save_path='full_evaluation.png')
+
+# Pairwise significance tests — referee response (Groups A, B, C)
+print("\n-- Pairwise Significance Tests (Groups A, B, C) --")
+sig_results = pairwise_significance_test(detail_df, alpha=0.05)
+print_significance_results(sig_results, alpha=0.05)
 
 # Extended evaluation
 print("\n-- Test 1: Ranking Disagreement --")
